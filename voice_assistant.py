@@ -183,8 +183,8 @@ class LLMProvider:
 
     async def generate_stream(self, prompt: str, history: list = None) -> AsyncIterator[str]:
         """
-        调用 vLLM API 生成文本（非流式）
-        返回: 完整的回复文本（以单条 yield 返回）
+        调用 vLLM API 流式生成文本
+        逐 token yield，实现边生成边送 TTS
         """
         import aiohttp
 
@@ -195,11 +195,10 @@ class LLMProvider:
                 messages.append(item)
         messages.append({"role": "user", "content": prompt})
 
-        # API 请求体（非流式）
         payload = {
             "model": self.model,
             "messages": messages,
-            "stream": False,
+            "stream": True,
             "temperature": 0.7,
             "max_tokens": 1024
         }
@@ -221,15 +220,23 @@ class LLMProvider:
                         error_text = await response.text()
                         raise Exception(f"LLM API 错误 (HTTP {response.status}): {error_text}")
 
-                    data = await response.json()
-
-                    if "choices" in data and len(data["choices"]) > 0:
-                        content = data["choices"][0].get("message", {}).get("content", "")
-                        if content:
-                            # 非流式输出，直接返回完整内容
-                            yield content
-                    else:
-                        raise Exception(f"LLM API 返回格式异常: {data}")
+                    async for line in response.content:
+                        line = line.decode("utf-8").strip()
+                        if not line or not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]  # 去掉 "data: " 前缀
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        choices = data.get("choices", [])
+                        if choices:
+                            delta = choices[0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                yield content
 
         except asyncio.TimeoutError:
             raise Exception("LLM API 请求超时")
@@ -507,29 +514,31 @@ class VoiceAssistant:
                 asyncio.create_task(self._process_llm_pipeline(text))
 
     async def _process_llm_pipeline(self, user_text: str):
-        """处理 LLM → TTS 流水线"""
+        """处理 LLM → TTS 流水线（边生成边播放）"""
         if self.is_interrupted:
             return
 
         self.state = SessionState.THINKING
         turn_id = self.turn_id
+        tts_tasks: list[asyncio.Task] = []
 
         print(f"\n[LLM] 🤔 用户: {user_text}")
         print("[LLM] 💭 助手: ", end="", flush=True)
 
         try:
             text_buffer = ""
-            full_response = ""
 
             # 流式生成
             async for token in self.llm.generate_stream(user_text):
                 # 检查是否被打断
                 if self.is_interrupted or turn_id != self.turn_id:
                     print(f"\n[LLM] ❌ 生成被中断")
+                    # 取消所有进行中的 TTS 任务
+                    for t in tts_tasks:
+                        t.cancel()
                     return
 
                 text_buffer += token
-                full_response += token
 
                 print(token, end="", flush=True)
 
@@ -537,16 +546,26 @@ class VoiceAssistant:
                 should_flush, flush_text, remaining = self.llm.should_flush_tts(text_buffer)
 
                 if should_flush and flush_text:
-                    # 启动 TTS
+                    # 后台启动 TTS，不阻塞当前 token 接收
                     if not self.is_interrupted:
-                        await self._synthesize_and_play(turn_id, flush_text)
+                        task = asyncio.create_task(
+                            self._synthesize_and_play(turn_id, flush_text)
+                        )
+                        tts_tasks.append(task)
                     text_buffer = remaining
 
             # 处理剩余文本
             if text_buffer and not self.is_interrupted:
-                await self._synthesize_and_play(turn_id, text_buffer, is_end=True)
+                task = asyncio.create_task(
+                    self._synthesize_and_play(turn_id, text_buffer, is_end=True)
+                )
+                tts_tasks.append(task)
 
             print()  # 换行
+
+            # 等待所有 TTS 播放完成
+            if tts_tasks:
+                await asyncio.gather(*tts_tasks, return_exceptions=True)
 
         except asyncio.CancelledError:
             print(f"\n[LLM] ❌ 任务被取消")
