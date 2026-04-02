@@ -1,0 +1,37 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+asr_logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Audio recordings (optional)
+*.wav
+*.pcm
+*.mp3
+
+# Test outputs
+test_output/
+results/
